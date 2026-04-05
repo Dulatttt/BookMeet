@@ -1,13 +1,34 @@
-import { Input } from '@/components/ui/input';
 import { useToast } from '@/hooks/use-toast';
 import { supabase } from "@/integrations/supabase/client";
-import { cn } from '@/lib/utils';
 import { format, isBefore, startOfDay } from 'date-fns';
-import { CalendarX, Loader2, Search } from 'lucide-react';
+import {
+  CalendarX,
+  FileSpreadsheet,
+  FileText,
+  Filter,
+  Loader2,
+  Search
+} from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
+
+// UI Components
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { MeetingCard } from './MeetingCard';
 
-// Определяем интерфейс для встречи
+// Библиотеки для экспорта
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
+import * as XLSX from 'xlsx';
+
+// Интерфейс данных
 interface Meeting {
   id: string;
   title: string;
@@ -28,7 +49,7 @@ export const Dashboard = () => {
   const [dateFilter, setDateFilter] = useState<string>('all');
   const [isLoading, setIsLoading] = useState(true);
 
-  // 1. Загрузка данных (вынесена в useCallback для возможности повторного вызова)
+  // 1. Загрузка данных из Supabase
   const fetchMeetings = useCallback(async () => {
     try {
       const { data, error } = await supabase
@@ -63,12 +84,12 @@ export const Dashboard = () => {
     }
   }, [toast]);
 
-  // 2. Real-time подписка (авто-обновление при изменениях в БД)
+  // 2. Real-time подписка и первичная загрузка
   useEffect(() => {
     fetchMeetings();
 
     const channel = supabase
-      .channel('schema-db-changes')
+      .channel('db-changes')
       .on('postgres_changes', 
         { event: '*', schema: 'public', table: 'bookings' }, 
         () => fetchMeetings()
@@ -80,29 +101,59 @@ export const Dashboard = () => {
     };
   }, [fetchMeetings]);
 
-  // 3. Универсальный обработчик смены статуса
-  const updateMeetingStatus = async (id: string, newStatus: Meeting['status']) => {
+  // 3. Функции экспорта
+  const exportToExcel = () => {
+    const dataToExport = filteredMeetings.map(m => ({
+      'Тема': m.title,
+      'Дата': m.date,
+      'Время': `${m.startTime} - ${m.endTime}`,
+      'Клиент': m.attendeeName,
+      'Email': m.attendee_email,
+      'Статус': m.status
+    }));
+
+    const worksheet = XLSX.utils.json_to_sheet(dataToExport);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Meetings");
+    XLSX.writeFile(workbook, `Bookings_${format(new Date(), 'dd-MM-yyyy')}.xlsx`);
+  };
+
+  const exportToPDF = () => {
+    const doc = new jsPDF();
+    doc.text("Выгрузка записей", 14, 15);
+    
+    const tableRows = filteredMeetings.map(m => [
+      m.title,
+      m.date,
+      m.startTime,
+      m.attendeeName,
+      m.status
+    ]);
+
+    autoTable(doc, {
+      head: [['Title', 'Date', 'Time', 'Client', 'Status']],
+      body: tableRows,
+      startY: 20,
+    });
+
+    doc.save(`Report_${format(new Date(), 'dd-MM-yyyy')}.pdf`);
+  };
+
+  // 4. Обработка статусов
+  const updateStatus = async (id: string, newStatus: Meeting['status']) => {
     const { error } = await supabase
       .from('bookings')
       .update({ status: newStatus })
       .eq('id', id);
 
     if (error) {
-      toast({
-        variant: "destructive",
-        title: "Ошибка",
-        description: "Не удалось обновить статус"
-      });
+      toast({ variant: "destructive", title: "Ошибка", description: "Не удалось обновить" });
     } else {
-      toast({
-        title: newStatus === 'confirmed' ? "Подтверждено" : "Отменено",
-        description: `Статус встречи успешно изменен на ${newStatus}`,
-      });
-      // fetchMeetings() вызовется автоматически через real-time подписку
+      toast({ title: "Обновлено", description: `Статус: ${newStatus}` });
     }
   };
 
-  // --- Фильтрация ---
+  // 5. Фильтрация данных
   const filteredMeetings = useMemo(() => {
     return meetings.filter(meeting => {
       const matchesSearch = 
@@ -127,68 +178,84 @@ export const Dashboard = () => {
     total: meetings.length,
     confirmed: meetings.filter(m => m.status === 'confirmed').length,
     pending: meetings.filter(m => m.status === 'pending').length,
-    cancelled: meetings.filter(m => m.status === 'cancelled').length,
   }), [meetings]);
 
-  if (isLoading) {
-    return (
-      <div className="flex flex-col items-center justify-center p-20 space-y-4">
-        <Loader2 className="w-10 h-10 animate-spin text-primary" />
-        <p className="text-muted-foreground animate-pulse">Загрузка ваших встреч...</p>
-      </div>
-    );
-  }
+  if (isLoading) return (
+    <div className="flex h-96 items-center justify-center flex-col gap-4">
+      <Loader2 className="w-8 h-8 animate-spin text-primary" />
+      <p className="text-muted-foreground">Загрузка данных...</p>
+    </div>
+  );
 
   return (
-    <div className="space-y-6 animate-fade-in">
+    <div className="p-6 max-w-7xl mx-auto space-y-6">
       {/* Секция статистики */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        {[
-          { label: 'Всего', value: stats.total, color: 'text-primary' },
-          { label: 'Подтверждено', value: stats.confirmed, color: 'text-green-500' },
-          { label: 'Ожидает', value: stats.pending, color: 'text-yellow-500' },
-          { label: 'Отменено', value: stats.cancelled, color: 'text-red-500' },
-        ].map((stat) => (
-          <div key={stat.label} className="glass rounded-xl p-4 border border-white/10 hover:border-white/20 transition-colors">
-            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">{stat.label}</p>
-            <p className={cn("text-3xl font-bold mt-1", stat.color)}>
-              {stat.value}
-            </p>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="glass p-4 rounded-xl border border-white/10">
+          <p className="text-sm text-muted-foreground">Всего заявок</p>
+          <p className="text-2xl font-bold">{stats.total}</p>
+        </div>
+        <div className="glass p-4 rounded-xl border border-green-500/20">
+          <p className="text-sm text-green-500">Подтверждено</p>
+          <p className="text-2xl font-bold text-green-500">{stats.confirmed}</p>
+        </div>
+        <div className="glass p-4 rounded-xl border border-yellow-500/20">
+          <p className="text-sm text-yellow-500">В ожидании</p>
+          <p className="text-2xl font-bold text-yellow-500">{stats.pending}</p>
+        </div>
+      </div>
+
+      {/* Панель инструментов */}
+      <div className="glass p-4 rounded-xl border border-white/10 flex flex-col md:flex-row gap-4 justify-between">
+        <div className="flex flex-1 gap-4 items-center">
+          <div className="relative flex-1 max-w-sm">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <Input 
+              placeholder="Поиск..." 
+              value={searchQuery} 
+              onChange={(e) => setSearchQuery(e.target.value)} 
+              className="pl-10 bg-black/20"
+            />
           </div>
-        ))}
+          
+          <Select value={statusFilter} onValueChange={setStatusFilter}>
+            <SelectTrigger className="w-[150px] bg-black/20">
+              <Filter className="w-4 h-4 mr-2" />
+              <SelectValue placeholder="Статус" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">Все</SelectItem>
+              <SelectItem value="confirmed">Одобрено</SelectItem>
+              <SelectItem value="pending">Ожидает</SelectItem>
+              <SelectItem value="cancelled">Отмена</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={exportToExcel} className="border-green-500/50">
+            <FileSpreadsheet className="w-4 h-4 mr-2" /> Excel
+          </Button>
+          <Button variant="outline" size="sm" onClick={exportToPDF} className="border-blue-500/50">
+            <FileText className="w-4 h-4 mr-2" /> PDF
+          </Button>
+        </div>
       </div>
 
-      {/* Поиск и фильтры */}
-      <div className="glass rounded-xl p-4 border border-white/10">
-         <div className="flex flex-col md:flex-row gap-4">
-            <div className="relative flex-1">
-               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-               <Input 
-                 placeholder="Поиск по названию или имени..." 
-                 value={searchQuery} 
-                 onChange={(e) => setSearchQuery(e.target.value)} 
-                 className="pl-10 bg-background/50 border-none ring-1 ring-white/10 focus-visible:ring-primary"
-               />
-            </div>
-            {/* Здесь можно добавить Select компоненты для statusFilter и dateFilter */}
-         </div>
-      </div>
-
-      {/* Список встреч */}
-      <div className="space-y-4">
+      {/* Список */}
+      <div className="grid gap-4">
         {filteredMeetings.length === 0 ? (
-          <div className="glass rounded-xl p-16 text-center border border-dashed border-white/20">
-            <CalendarX className="w-12 h-12 mx-auto mb-4 text-muted-foreground opacity-20" />
-            <p className="text-lg font-medium text-muted-foreground">Встреч не найдено</p>
-            <p className="text-sm text-muted-foreground/60">Попробуйте изменить параметры фильтрации</p>
+          <div className="text-center py-20 glass rounded-xl opacity-50">
+            <CalendarX className="mx-auto w-12 h-12 mb-2" />
+            <p>Ничего не найдено</p>
           </div>
         ) : (
-          filteredMeetings.map((meeting) => (
-            <MeetingCard
-              key={meeting.id}
-              meeting={meeting}
-              onCancel={(id) => updateMeetingStatus(id, 'cancelled')}
-              onConfirm={(id) => updateMeetingStatus(id, 'confirmed')}
+          filteredMeetings.map(meeting => (
+            <MeetingCard 
+              key={meeting.id} 
+              meeting={meeting} 
+              onConfirm={(id) => updateStatus(id, 'confirmed')}
+              onCancel={(id) => updateStatus(id, 'cancelled')}
             />
           ))
         )}
